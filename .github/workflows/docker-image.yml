@@ -1,36 +1,39 @@
-name: Build and Push Docker Image to ECR (Manual)
+name: Build → Push to ECR → Deploy to EC2
 
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Docker image tag (must match v<MAJOR>.<MINOR>.<PATCH> format, e.g., v1.0.0)'
+        description: 'Image tag to build & deploy (format: vMAJOR.MINOR.PATCH, e.g. v1.0.0)'
         required: true
         default: 'v1.0.0'
 
 env:
+  IMAGE_LOCAL_NAME: "muralisocial123/ust-test-image"
   ECR_REGISTRY: "909688465000.dkr.ecr.ap-south-1.amazonaws.com"
   ECR_REPOSITORY: "ust/training"
   AWS_REGION: "ap-south-1"
+  EC2_USER: "ec2-user"
+  EC2_HOST: "43.204.231.70"
+  EC2_SSH_PORT: "22"
+  CONTAINER_NAME: "ust-training-app"
 
 jobs:
-  build-and-push:
+  build-push-deploy:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
 
     steps:
-      - name: Validate tag format
+      - name: Validate image tag
         id: validate
         run: |
           TAG="${{ github.event.inputs.tag }}"
           echo "Provided tag: $TAG"
-
-          # Validate semantic versioning (vX.Y.Z)
           if ! echo "$TAG" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
-            echo "::error::Invalid tag format! Expected pattern: v<MAJOR>.<MINOR>.<PATCH> (example: v1.0.0)"
+            echo "::error::Invalid tag format. Expected vMAJOR.MINOR.PATCH (example: v1.0.0)"
             exit 1
           fi
-
-          echo "Tag validation successful: $TAG"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
       - name: Checkout repository
@@ -38,7 +41,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Configure AWS credentials
+      - name: Configure AWS credentials for runner
         uses: aws-actions/configure-aws-credentials@v2
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -47,27 +50,152 @@ jobs:
 
       - name: Ensure ECR repository exists
         run: |
-          echo "Checking if ECR repository exists: ${ECR_REPOSITORY}"
           aws ecr describe-repositories --repository-names "${ECR_REPOSITORY}" >/dev/null 2>&1 || \
             aws ecr create-repository --repository-name "${ECR_REPOSITORY}" >/dev/null
-          echo "ECR repository verified: ${ECR_REPOSITORY}"
+        env:
+          ECR_REPOSITORY: ${{ env.ECR_REPOSITORY }}
 
-      - name: Login to Amazon ECR
-        id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v2
+      - name: Login Docker to ECR
+        run: |
+          aws ecr get-login-password --region "${AWS_REGION}" | docker login --username AWS --password-stdin "${ECR_REGISTRY}"
+        env:
+          AWS_REGION: ${{ env.AWS_REGION }}
+          ECR_REGISTRY: ${{ env.ECR_REGISTRY }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build and Push Docker Image to ECR
+      - name: Build and push Docker image to ECR
+        id: build
         uses: docker/build-push-action@v5
         with:
           context: .
           file: ./Dockerfile
           push: true
-          tags: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ steps.validate.outputs.tag }}
+          tags: |
+            ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ steps.validate.outputs.tag }}
+            ${{ env.IMAGE_LOCAL_NAME }}:${{ steps.validate.outputs.tag }}
 
-      - name: Confirm Build Success
+      - name: Write PEM key to disk (from secret)
+        id: write_pem
         run: |
-          echo "Successfully built and pushed image:"
-          echo "${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ steps.validate.outputs.tag }}"
+          printf "%s\n" "${{ secrets.AWS_KEY_PAIR }}" > key.pem
+          chmod 600 key.pem
+          echo "pem_path=$(pwd)/key.pem" >> "$GITHUB_OUTPUT"
+
+      - name: Ensure SSH client installed
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y openssh-client
+
+      - name: Deploy to EC2 (pull image & run container)
+        env:
+          PEM_PATH: ${{ steps.write_pem.outputs.pem_path }}
+          ECR_REGISTRY: ${{ env.ECR_REGISTRY }}
+          ECR_REPOSITORY: ${{ env.ECR_REPOSITORY }}
+          AWS_REGION: ${{ env.AWS_REGION }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          EC2_USER: ${{ env.EC2_USER }}
+          EC2_HOST: ${{ env.EC2_HOST }}
+          EC2_PORT: ${{ env.EC2_SSH_PORT }}
+          CONTAINER_NAME: ${{ env.CONTAINER_NAME }}
+        run: |
+          set -euo pipefail
+
+          TAG="${{ steps.validate.outputs.tag }}"
+          PEM="${PEM_PATH}"
+          HOST="${EC2_HOST}"
+          USER="${EC2_USER}"
+          PORT="${EC2_PORT}"
+          IMAGE="${ECR_REGISTRY}/${ECR_REPOSITORY}:${TAG}"
+          CONTAINER_NAME="${CONTAINER_NAME}"
+
+          echo "Deploying image: $IMAGE to ${USER}@${HOST}"
+
+          remote_script=$(cat <<'REMOTE'
+          set -euo pipefail
+          echo "Remote: starting deployment..."
+
+          # Detect OS
+          if [ -f /etc/os-release ]; then
+            . /etc/os-release
+            OS_ID="$ID"
+          else
+            OS_ID="unknown"
+          fi
+          echo "Remote: Detected OS - $OS_ID"
+
+          # Install Docker
+          if ! command -v docker >/dev/null 2>&1; then
+            echo "Remote: Docker not found — installing..."
+            if [ "$OS_ID" = "amzn" ] || [ "$OS_ID" = "amazon" ] || [ "$OS_ID" = "centos" ] || [ "$OS_ID" = "rhel" ]; then
+              if command -v yum >/dev/null 2>&1; then
+                if command -v amazon-linux-extras >/dev/null 2>&1; then
+                  sudo amazon-linux-extras install docker -y
+                else
+                  sudo yum install -y docker
+                fi
+                sudo systemctl enable --now docker
+              fi
+            elif [ "$OS_ID" = "ubuntu" ] || [ "$OS_ID" = "debian" ]; then
+              sudo apt-get update -y
+              sudo apt-get install -y apt-transport-https ca-certificates curl gnupg-agent software-properties-common
+              curl -fsSL https://download.docker.com/linux/${OS_ID}/gpg | sudo apt-key add -
+              sudo add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/${OS_ID} $(lsb_release -cs) stable"
+              sudo apt-get update -y
+              sudo apt-get install -y docker-ce docker-ce-cli containerd.io
+              sudo systemctl enable --now docker
+            else
+              echo "Remote: Unknown OS; attempting get.docker.com install..."
+              curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
+              sudo sh /tmp/get-docker.sh
+            fi
+            if id ec2-user >/dev/null 2>&1; then
+              sudo usermod -aG docker ec2-user || true
+            fi
+          else
+            echo "Remote: Docker already installed: $(docker --version)"
+          fi
+
+          # Install AWS CLI
+          if ! command -v aws >/dev/null 2>&1; then
+            echo "Remote: Installing AWS CLI v2..."
+            sudo apt-get update -y || true
+            sudo apt-get install -y unzip || true
+            curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+            unzip -q /tmp/awscliv2.zip -d /tmp
+            sudo /tmp/aws/install || true
+          else
+            echo "Remote: AWS CLI present: $(aws --version)"
+          fi
+
+          # Login to ECR and pull image
+          echo "Remote: Pulling image ${IMAGE}..."
+          aws ecr get-login-password --region "${AWS_REGION}" | docker login --username AWS --password-stdin "${ECR_REGISTRY}"
+          docker pull "${IMAGE}"
+
+          # Remove existing container
+          if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
+            echo "Remote: Removing existing container ${CONTAINER_NAME}"
+            docker rm -f "${CONTAINER_NAME}" || true
+          fi
+
+          # Run container
+          echo "Remote: Running container on port 3000"
+          docker run -d --name "${CONTAINER_NAME}" --restart unless-stopped -p 3000:3000 "${IMAGE}"
+
+          echo "Remote: Deployment complete. Active containers:"
+          docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}"
+REMOTE
+          )
+
+          printf '%s\n' "$remote_script" | \
+            ssh -o StrictHostKeyChecking=no -i "${PEM}" -p "${PORT}" "${USER}@${HOST}" \
+            "AWS_ACCESS_KEY_ID='${AWS_ACCESS_KEY_ID}' AWS_SECRET_ACCESS_KEY='${AWS_SECRET_ACCESS_KEY}' AWS_REGION='${AWS_REGION}' ECR_REGISTRY='${ECR_REGISTRY}' ECR_REPOSITORY='${ECR_REPOSITORY}' IMAGE='${IMAGE}' CONTAINER_NAME='${CONTAINER_NAME}' bash -s"
+
+      - name: Deployment result
+        run: |
+          echo "✅ Deployment successful!"
+          echo "Access the app at: http://${{ env.EC2_HOST }}:3000/"
+          echo "Ensure the EC2 Security Group allows inbound TCP 3000 from your IP."
