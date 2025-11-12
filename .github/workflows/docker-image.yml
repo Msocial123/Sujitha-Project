@@ -1,6 +1,10 @@
 name: Build → Push to ECR → Deploy to EC2 (ECR only)
 
 on:
+  push:
+    branches:
+      - main
+      - master
   workflow_dispatch:
     inputs:
       tag:
@@ -24,6 +28,8 @@ env:
 jobs:
   build-push-deploy:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
 
     steps:
       - name: Validate tag
@@ -38,7 +44,8 @@ jobs:
 
       - name: Checkout
         uses: actions/checkout@v4
-        with: { fetch-depth: 0 }
+        with:
+          fetch-depth: 0
 
       - name: Configure AWS creds for runner
         uses: aws-actions/configure-aws-credentials@v2
@@ -47,11 +54,12 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Ensure ECR repository exists
+      - name: Ensure ECR repo exists
         run: |
           aws ecr describe-repositories --repository-names "${ECR_REPOSITORY}" >/dev/null 2>&1 || \
             aws ecr create-repository --repository-name "${ECR_REPOSITORY}" >/dev/null
-        env: { ECR_REPOSITORY: ${{ env.ECR_REPOSITORY }} }
+        env:
+          ECR_REPOSITORY: ${{ env.ECR_REPOSITORY }}
 
       - name: Login Docker to ECR (runner)
         run: |
@@ -72,7 +80,7 @@ jobs:
           push: true
           tags: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ steps.validate.outputs.tag }}
 
-      - name: Deploy to EC2 via SSH (appleboy) — inject AWS creds into remote script
+      - name: Deploy to EC2 via SSH (appleboy) — AL2023-aware
         id: deploy_ssh
         uses: appleboy/ssh-action@v0.1.7
         with:
@@ -84,47 +92,80 @@ jobs:
           script: |
             set -euxo pipefail
 
-            # ---- Inject concrete non-secret values (expanded on runner) ----
+            # Inject runner-expanded values so remote has concrete env vars
             ECR_REGISTRY="${{ env.ECR_REGISTRY }}"
             ECR_REPOSITORY="${{ env.ECR_REPOSITORY }}"
             AWS_REGION="${{ env.AWS_REGION }}"
             CONTAINER_NAME="${{ env.CONTAINER_NAME }}"
             TAG="${{ steps.validate.outputs.tag }}"
             IMAGE="${ECR_REGISTRY}/${ECR_REPOSITORY}:${TAG}"
-            # ----------------------------------------------------------------
 
-            # ---- Inject AWS credentials HERE (expanded on runner) ----
+            # Inject credentials (these will be on remote for the run)
             AWS_ACCESS_KEY_ID="${{ secrets.AWS_ACCESS_KEY_ID }}"
             AWS_SECRET_ACCESS_KEY="${{ secrets.AWS_SECRET_ACCESS_KEY }}"
-            # Do NOT echo these values
             export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_REGION
-            # -----------------------------------------------------------
 
             echo "Remote: starting deployment for ${IMAGE}"
 
-            # Detect OS
-            if [ -f /etc/os-release ]; then . /etc/os-release; OS_ID="$ID"; else OS_ID="unknown"; fi
-            echo "Remote: detected OS = ${OS_ID}"
+            # Detect OS (we know it's Amazon Linux 2023 from your message)
+            if [ -f /etc/os-release ]; then
+              . /etc/os-release
+              OS_ID="$ID"
+              OS_VER="$VERSION_ID"
+            else
+              OS_ID="unknown"
+              OS_VER="unknown"
+            fi
+            echo "Remote: detected OS = ${OS_ID} ${OS_VER}"
 
-            # Docker already present on your AMI — but keep check to be safe
+            # Install Docker on Amazon Linux 2023 (dnf) OR fallback to yum/apt/get.docker.com
             if ! command -v docker >/dev/null 2>&1; then
-              echo "Remote: installing Docker..."
-              if [ "${OS_ID}" = "amzn" ] || [ "${OS_ID}" = "amazon" ]; then
-                sudo amazon-linux-extras install docker -y || sudo yum install -y docker
+              echo "Remote: Docker not found — installing..."
+              if [ "${OS_ID}" = "amzn" ] && [ "${OS_VER%%.*}" -ge 2023 ]; then
+                # Amazon Linux 2023 uses dnf
+                sudo dnf -y install docker
+                sudo systemctl enable --now docker
+              elif command -v amazon-linux-extras >/dev/null 2>&1; then
+                sudo amazon-linux-extras install docker -y
+                sudo systemctl enable --now docker
+              elif command -v yum >/dev/null 2>&1; then
+                sudo yum install -y docker
+                sudo systemctl enable --now docker
+              elif [ "${OS_ID}" = "ubuntu" ] || [ "${OS_ID}" = "debian" ]; then
+                sudo apt-get update -y
+                sudo apt-get install -y apt-transport-https ca-certificates curl gnupg-agent software-properties-common
+                curl -fsSL https://download.docker.com/linux/${OS_ID}/gpg | sudo apt-key add -
+                sudo add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/${OS_ID} $(lsb_release -cs) stable"
+                sudo apt-get update -y
+                sudo apt-get install -y docker-ce docker-ce-cli containerd.io
                 sudo systemctl enable --now docker
               else
-                # fallback using get.docker.com
+                echo "Remote: Unknown distro — running get.docker.com installer"
                 curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
                 sudo sh /tmp/get-docker.sh
               fi
-              if id ec2-user >/dev/null 2>&1; then sudo usermod -aG docker ec2-user || true; fi
+
+              if id ec2-user >/dev/null 2>&1; then
+                sudo usermod -aG docker ec2-user || true
+              fi
             else
-              echo "Remote: docker present: $(docker --version)"
+              echo "Remote: docker already present: $(docker --version)"
             fi
 
-            # AWS CLI already present on your instance; ensure env creds available
+            # Ensure aws cli present (your AMI already has aws cli)
+            if ! command -v aws >/dev/null 2>&1; then
+              echo "Remote: Installing AWS CLI v2..."
+              sudo dnf -y install unzip || sudo yum -y install unzip || sudo apt-get install -y unzip || true
+              curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+              unzip -q /tmp/awscliv2.zip -d /tmp
+              sudo /tmp/aws/install || true
+            else
+              echo "Remote: aws present: $(aws --version)"
+            fi
+
+            # Verify credentials were injected
             if [ -z "${AWS_ACCESS_KEY_ID:-}" ] || [ -z "${AWS_SECRET_ACCESS_KEY:-}" ]; then
-              echo "Remote: AWS credentials not present (after injection); aborting"
+              echo "Remote: AWS credentials not present; aborting"
               exit 1
             fi
 
@@ -132,16 +173,19 @@ jobs:
             aws ecr get-login-password --region "${AWS_REGION}" | docker login --username AWS --password-stdin "${ECR_REGISTRY}"
             docker pull "${IMAGE}"
 
+            # Stop & remove existing container if present
             if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
               echo "Remote: stopping & removing ${CONTAINER_NAME}"
               docker rm -f "${CONTAINER_NAME}" || true
             fi
 
+            # Run app container on 3000
             docker run -d --name "${CONTAINER_NAME}" --restart unless-stopped -p 3000:3000 "${IMAGE}"
+
             echo "Remote: deployment finished"
             docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}"
         env:
-          # These ensure the appleboy container has AWS envs available too, but credentials are injected above as well.
+          # Action container envs (the credentials are already injected into the remote script)
           AWS_REGION: ${{ env.AWS_REGION }}
           ECR_REGISTRY: ${{ env.ECR_REGISTRY }}
           ECR_REPOSITORY: ${{ env.ECR_REPOSITORY }}
@@ -176,5 +220,5 @@ jobs:
       - name: Deployment result
         if: success()
         run: |
-          echo "✅ Deployment succeeded!"
+          echo "Deployment succeeded!"
           echo "Application should be available at: http://${{ env.EC2_HOST }}:${{ env.HEALTHCHECK_PORT }}${{ env.HEALTHCHECK_PATH }}"
